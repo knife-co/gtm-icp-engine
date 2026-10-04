@@ -1,0 +1,382 @@
+{
+  "name": "P1 – ICP Engine (Part 1: job posts)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "49c5cb1d-9d20-4cf9-bbbe-5d471ce9d00c",
+      "name": "Start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://remoteok.com/api",
+        "options": {}
+      },
+      "id": "8f0208ef-326a-4e94-a6bc-5f42e7c908da",
+      "name": "Get RemoteOK jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Source: Remote OK (credit + link back if shown publicly)"
+    },
+    {
+      "parameters": {
+        "url": "https://remotive.com/api/remote-jobs",
+        "options": {}
+      },
+      "id": "476c8266-becb-4b0e-9826-56b352cf803c",
+      "name": "Get Remotive jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        240
+      ],
+      "notes": "Max ~4 calls/day. Pin this node's output while testing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// RemoteOK returns one item per job. The first item is their legal notice, so skip anything without an id.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!j.id || !j.position) continue;\n  const { description, ...rest } = j;\n  out.push({ json: {\n    source: 'remoteok',\n    source_job_id: String(j.id),\n    title: j.position,\n    company_name: j.company,\n    company_slug: null,\n    company_domain: null,\n    url: j.url,\n    apply_url: j.apply_url || j.url,\n    published_at: j.date,\n    location_restrictions: j.location ? [j.location] : [],\n    seniority: [],\n    tags: j.tags || [],\n    description: description || '',\n    raw: rest\n  }});\n}\nreturn out;"
+      },
+      "id": "d8c04f6b-0232-4590-af90-a4daa23640c3",
+      "name": "Clean RemoteOK",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Remotive returns one item holding a \"jobs\" list. Turn each job into the same shape as RemoteOK.\nconst out = [];\nfor (const item of $input.all()) {\n  for (const j of (item.json.jobs || [])) {\n    const { description, ...rest } = j;\n    out.push({ json: {\n      source: 'remotive',\n      source_job_id: String(j.id),\n      title: j.title,\n      company_name: j.company_name,\n      company_slug: null,\n      company_domain: null,\n      url: j.url,\n      apply_url: j.url,\n      published_at: j.publication_date,\n      location_restrictions: j.candidate_required_location ? [j.candidate_required_location] : [],\n      seniority: [],\n      tags: j.tags || [],\n      description: description || '',\n      raw: rest\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "2f39f22a-828a-4137-be1d-a008440b0565",
+      "name": "Clean Remotive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "id": "5653540e-fb06-4e1e-9b06-4695d5c7c7f0",
+      "name": "Combine sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        480,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hiring gate: keep only GTM-type titles posted in the last 30 days, and drop duplicates.\nconst TITLE = /(\\bgtm\\b|go[- ]to[- ]market|rev ?ops|revenue operations|marketing operations|marketing ops|sales operations|sales ops|growth operations|growth ops|\\bcrm\\b|salesforce (admin|administrator|developer|consultant)|hubspot|marketing automation)/i;\nconst cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;\nconst seen = new Set();\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!j.title || !TITLE.test(j.title)) continue;\n  const t = Date.parse(j.published_at);\n  if (isNaN(t) || t < cutoff) continue;\n  const key = j.source + ':' + j.source_job_id;\n  if (seen.has(key)) continue;\n  seen.add(key);\n  out.push({ json: { ...j, published_at: new Date(t).toISOString() } });\n}\nreturn out;"
+      },
+      "id": "ef27ffcc-a207-4ba5-9130-e258674e5c8b",
+      "name": "Keep GTM roles (last 30 days)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "job_posts",
+        "returnAll": true
+      },
+      "id": "2b5d2eb8-f64f-436f-9ecf-139c787380c2",
+      "name": "Get saved job posts",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        960,
+        288
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "source",
+              "field2": "source"
+            },
+            {
+              "field1": "source_job_id",
+              "field2": "source_job_id"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a45a690f-d566-4ca9-b2b0-28b10120b81b",
+      "name": "Find new posts",
+      "type": "n8n-nodes-base.compareDatasets",
+      "typeVersion": 2.3,
+      "position": [
+        1200,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "job_posts",
+        "dataToSend": "autoMapInputData"
+      },
+      "id": "60c04c43-b0a9-4074-9200-b5f3492a8236",
+      "name": "Save new posts",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One search per GTM keyword. Himalayas searches titles and descriptions; the GTM filter later keeps only matching titles.\nreturn [\n  'revenue operations', 'revops', 'gtm engineer', 'go-to-market',\n  'marketing operations', 'sales operations', 'growth operations',\n  'crm manager', 'hubspot', 'salesforce administrator', 'marketing automation'\n].map(q => ({ json: { q } }));"
+      },
+      "id": "h1",
+      "name": "Himalayas search terms",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        528
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://himalayas.app/jobs/api/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.q }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          },
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "name": "page",
+                    "value": "={{ $pageCount + 1 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.jobs || $response.body.jobs.length === 0 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 10,
+              "requestInterval": 1500
+            }
+          }
+        }
+      },
+      "id": "h2",
+      "name": "Search Himalayas jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        528
+      ],
+      "notes": "Source: Himalayas (credit + link back to himalayas.app if shown publicly). Data refreshes daily; run at most once a day."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Each item is one page of Himalayas results holding a \"jobs\" list. Turn each job into the same shape as the other sources.\nconst toText = x => typeof x === 'string' ? x : (x && (x.name || x.alpha2 || x.code)) || JSON.stringify(x);\nconst out = [];\nfor (const item of $input.all()) {\n  for (const j of (item.json.jobs || [])) {\n    const { description, ...rest } = j;\n    const ts = typeof j.pubDate === 'number' ? (j.pubDate > 1e12 ? j.pubDate : j.pubDate * 1000) : Date.parse(j.pubDate);\n    out.push({ json: {\n      source: 'himalayas',\n      source_job_id: String(j.guid || j.applicationLink),\n      title: j.title,\n      company_name: j.companyName,\n      company_slug: j.companySlug || null,\n      company_domain: null,\n      url: j.guid && String(j.guid).startsWith('http') ? j.guid : j.applicationLink,\n      apply_url: j.applicationLink,\n      published_at: isNaN(ts) ? null : new Date(ts).toISOString(),\n      location_restrictions: (j.locationRestrictions || []).map(toText),\n      seniority: (j.seniority || []).map(toText),\n      tags: (j.categories || []).map(toText),\n      description: description || '',\n      raw: rest\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "h3",
+      "name": "Clean Himalayas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        528
+      ]
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Get RemoteOK jobs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Remotive jobs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Himalayas search terms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get RemoteOK jobs": {
+      "main": [
+        [
+          {
+            "node": "Clean RemoteOK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Remotive jobs": {
+      "main": [
+        [
+          {
+            "node": "Clean Remotive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean RemoteOK": {
+      "main": [
+        [
+          {
+            "node": "Combine sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Remotive": {
+      "main": [
+        [
+          {
+            "node": "Combine sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Combine sources": {
+      "main": [
+        [
+          {
+            "node": "Keep GTM roles (last 30 days)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep GTM roles (last 30 days)": {
+      "main": [
+        [
+          {
+            "node": "Find new posts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get saved job posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get saved job posts": {
+      "main": [
+        [
+          {
+            "node": "Find new posts",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Find new posts": {
+      "main": [
+        [
+          {
+            "node": "Save new posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Himalayas search terms": {
+      "main": [
+        [
+          {
+            "node": "Search Himalayas jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Himalayas jobs": {
+      "main": [
+        [
+          {
+            "node": "Clean Himalayas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Himalayas": {
+      "main": [
+        [
+          {
+            "node": "Combine sources",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  }
+}

@@ -1,0 +1,253 @@
+{
+  "name": "P1 – ICP Engine (Part 2: enrich + score)",
+  "nodes": [
+    {
+      "id": "a1",
+      "name": "Start",
+      "parameters": {},
+      "position": [
+        0,
+        200
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "a2",
+      "name": "Get companies to enrich",
+      "notes": "Return All: processes every company not yet looked up.",
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "tableId": "companies_to_enrich"
+      },
+      "position": [
+        220,
+        200
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    },
+    {
+      "id": "a3",
+      "name": "Find domain (Clearbit)",
+      "notes": "Free Clearbit company lookup by name, 1 per second.",
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "options": {
+          "batching": {
+            "batch": {
+              "batchInterval": 1000,
+              "batchSize": 1
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "url": "=https://autocomplete.clearbit.com/v1/companies/suggest?query={{ encodeURIComponent($json.company_name) }}"
+      },
+      "position": [
+        440,
+        200
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "a4",
+      "name": "Pick best domain match",
+      "parameters": {
+        "jsCode": "// Clearbit returns a list of possible companies. Keep a domain only if the name matches,\n// then rate it: 'high' if the domain itself looks like the company name, otherwise 'review' (check by hand).\nconst c = $('Get companies to enrich').item.json;\nlet list = [];\ntry { list = JSON.parse($json.data || '[]'); } catch (e) { list = []; }\n\nconst base = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();\nconst clean = s => base(s)\n  .replace(/\\(.*\\)/g, '')\n  .replace(/\\b(inc|llc|ltd|limited|gmbh|corp|corporation|co|plc|sa|ag|bv|group|holdings|technologies|technology|labs|hq|the|an|a)\\b/g, '')\n  .replace(/[^a-z0-9]/g, '');\nconst SUFFIX = /(hq|app|ai|io|grp|group|inc|global|team|labs|software|tech)$/;\nconst want = clean(c.company_name);\n\nlet pick = null;\nfor (const s of list) {\n  const got = clean(s.name);\n  if (got && got === want) { pick = s; break; }\n  if (!pick && got && want && (got.startsWith(want) || want.startsWith(got))) pick = s;\n}\n\nconst domain = pick ? String(pick.domain).toLowerCase().replace(/^www\\./, '') : null;\nlet domain_confidence = null;\nif (domain) {\n  const d = domain.split('.')[0].replace(/[^a-z0-9]/g, '');\n  const dc = d.replace(/^(go|get|try|use|join|hey|my)/, '').replace(SUFFIX, '');\n  const nc = want.replace(SUFFIX, '');\n  domain_confidence = (d === want || dc === nc || d === nc || dc === want) ? 'high' : 'review';\n}\n\nreturn { json: {\n  company_key: c.company_key,\n  company_name: c.company_name,\n  company_slug: c.company_slug,\n  domain,\n  domain_confidence,\n  employee_range: null,\n  employee_count: null,\n  hq: null,\n  enriched_at: new Date().toISOString(),\n  enrich_error: domain ? null : (list.length ? `No confident name match (top result: ${list[0].name} / ${list[0].domain})` : 'No Clearbit result')\n}};",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        660,
+        180
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "a5",
+      "name": "Save to icp_companies",
+      "notes": "Upsert on company_key: re-runs update instead of duplicating.",
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/icp_companies?on_conflict=company_key"
+      },
+      "position": [
+        880,
+        180
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "a6",
+      "name": "Format page error",
+      "parameters": {
+        "jsCode": "return { json: { node: 'Find domain (Clearbit)', error: String($json.error?.message || $json.error || 'unknown error').slice(0, 500), payload: $('Get companies to enrich').item.json } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        660,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "a7",
+      "name": "Format save error",
+      "parameters": {
+        "jsCode": "return { json: { node: 'Save to icp_companies', error: String($json.error?.message || $json.error || 'unknown error').slice(0, 500), payload: $('Pick best domain match').item.json } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        1100,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "a8",
+      "name": "Save to dead_letter",
+      "parameters": {
+        "dataToSend": "autoMapInputData",
+        "operation": "create",
+        "tableId": "dead_letter"
+      },
+      "position": [
+        1320,
+        400
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Format page error": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to dead_letter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Format save error": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to dead_letter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Get companies to enrich": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Find domain (Clearbit)",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Find domain (Clearbit)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Pick best domain match",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Format page error",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Pick best domain match": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to icp_companies",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Save to icp_companies": {
+      "main": [
+        [],
+        [
+          {
+            "index": 0,
+            "node": "Format save error",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get companies to enrich",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

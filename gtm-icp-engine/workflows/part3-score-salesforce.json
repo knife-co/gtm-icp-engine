@@ -1,0 +1,409 @@
+{
+  "name": "P1 – ICP Engine (Part 3: score + Salesforce)",
+  "nodes": [
+    {
+      "id": "s1",
+      "name": "Start",
+      "parameters": {},
+      "position": [
+        0,
+        300
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "s2",
+      "name": "Get companies to score",
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "tableId": "companies_to_score"
+      },
+      "position": [
+        220,
+        300
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    },
+    {
+      "id": "s3",
+      "name": "Score with ICP v2",
+      "parameters": {
+        "jsCode": "// ICP v2: two gates, then weighted points. Every score carries its reasoning.\nconst now = Date.now();\nconst out = [];\nfor (const it of $input.all()) {\n  const c = it.json;\n  const countries = c.countries || [];\n  const tech = c.tech_hits || [];\n  let open = 'no';\n  if (c.open_worldwide || c.includes_nigeria) open = 'yes';\n  else if (c.includes_africa || countries.length >= 3) open = 'maybe';\n  const gate = open !== 'no';\n  const reasons = [];\n  let score = 0;\n  if (!gate) {\n    reasons.push(`Gated out: only hires in ${countries.slice(0, 3).join(', ') || 'one country'}.`);\n  } else {\n    reasons.push(`Gates passed: hiring (${c.post_count} GTM post${c.post_count > 1 ? 's' : ''}); remote ${open === 'yes' ? 'confirmed (worldwide or includes Nigeria)' : 'possible (hires in Africa or 3+ countries)'}.`);\n    if (c.role_fit) { score += 30; reasons.push('Role fit +30: a role at junior-mid level.'); }\n    else reasons.push('Role fit 0: only senior/leadership titles.');\n    if (tech.length) { score += 20; reasons.push(`Tech +20: posts mention ${tech.join(', ')}.`); }\n    else reasons.push('Tech 0: no target tools mentioned.');\n    if (open === 'yes') { score += 15; reasons.push('Remote confirmed +15.'); }\n    else reasons.push('Remote confirmed 0: open to some regions, Nigeria not confirmed.');\n    const age = Math.floor((now - Date.parse(c.latest_post_at)) / 86400000);\n    if (age <= 7) { score += 15; reasons.push(`Freshness +15: newest post ${age} days old.`); }\n    else reasons.push(`Freshness 0: newest post ${age} days old.`);\n    reasons.push('Reachable and Company size: unverified (0).');\n  }\n  reasons.push(`Titles: ${(c.hiring_titles || []).slice(0, 3).join('; ')}.`);\n  out.push({ json: {\n    company_key: c.company_key,\n    company_name: c.company_name,\n    domain: c.domain,\n    domain_confidence: c.domain_confidence,\n    gate_passed: gate,\n    open_to_lagos: open,\n    icp_score: score,\n    icp_reasoning: reasons.join(' '),\n    scored_at: new Date().toISOString()\n  }});\n}\nreturn out;"
+      },
+      "position": [
+        440,
+        300
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "executeOnce": true,
+      "id": "s4",
+      "name": "Save scores to Supabase",
+      "notes": "One bulk upsert of every score + reasoning.",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "jsonBody": "={{ JSON.stringify($input.all().map(i => ({ company_key: i.json.company_key, gate_passed: i.json.gate_passed, open_to_lagos: i.json.open_to_lagos, icp_score: i.json.icp_score, icp_reasoning: i.json.icp_reasoning, scored_at: i.json.scored_at }))) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/icp_companies?on_conflict=company_key"
+      },
+      "position": [
+        680,
+        140
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "s5",
+      "name": "Keep qualified (50+)",
+      "parameters": {
+        "jsCode": "// Only companies that passed the gates, scored 50 or more, and have a HIGH-confidence domain (the Salesforce key).\n// 'review' domains stay in Supabase until checked by hand.\nreturn $input.all().filter(i => i.json.gate_passed && i.json.icp_score >= 50 && i.json.domain && i.json.domain_confidence === 'high');"
+      },
+      "position": [
+        680,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "s6",
+      "name": "Build Salesforce batches",
+      "parameters": {
+        "jsCode": "// Group qualified companies into batches of 200 for the Composite API.\nconst today = new Date().toISOString().slice(0, 10);\nconst all = $input.all().map(i => i.json);\nconst out = [];\nfor (let s = 0; s < all.length; s += 200) {\n  const chunk = all.slice(s, s + 200);\n  out.push({ json: {\n    keys: chunk.map(c => c.company_key),\n    body: {\n      allOrNone: false,\n      records: chunk.map(c => ({\n        attributes: { type: 'Account' },\n        Name: c.company_name,\n        Domain__c: c.domain,\n        ICP_Score__c: c.icp_score,\n        ICP_Score_Reasoning__c: String(c.icp_reasoning).slice(0, 5000),\n        Enrichment_Source__c: 'Web',\n        Data_Last_Verified__c: today\n      }))\n    }\n  }});\n}\nreturn out;"
+      },
+      "position": [
+        900,
+        400
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "salesforceJwtApi": {
+          "name": "Salesforce JWT account"
+        }
+      },
+      "id": "s7",
+      "name": "Upsert to Salesforce",
+      "notes": "Composite upsert on Domain__c, up to 200 per call.",
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "method": "PATCH",
+        "nodeCredentialType": "salesforceJwtApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_INSTANCE.my.salesforce.com/services/data/v62.0/composite/sobjects/Account/Domain__c"
+      },
+      "position": [
+        1120,
+        400
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "s8",
+      "name": "Read Salesforce results",
+      "parameters": {
+        "jsCode": "// Match each Salesforce result back to its company (results come back in the same order as sent).\nconst batches = $('Build Salesforce batches').all();\nconst out = [];\nfor (const item of $input.all()) {\n  const idx = item.pairedItem?.item ?? 0;\n  const keys = batches[idx].json.keys;\n  const sent = batches[idx].json.body.records;\n  let results = [];\n  try { results = JSON.parse(item.json.data || '[]'); } catch (e) { results = []; }\n  results.forEach((r, k) => {\n    out.push({ json: {\n      company_key: keys[k],\n      ok: !!r.success,\n      sf_account_id: r.id || null,\n      created: !!r.created,\n      error: r.success ? null : JSON.stringify(r.errors || []),\n      record: sent[k]\n    }});\n  });\n}\nreturn out;"
+      },
+      "position": [
+        1340,
+        380
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "executeOnce": true,
+      "id": "s9",
+      "name": "Save sync status",
+      "parameters": {
+        "authentication": "predefinedCredentialType",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "jsonBody": "={{ JSON.stringify($input.all().filter(i => i.json.ok).map(i => ({ company_key: i.json.company_key, sf_synced: true, sf_account_id: i.json.sf_account_id }))) }}",
+        "method": "POST",
+        "nodeCredentialType": "supabaseApi",
+        "options": {},
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "url": "https://YOUR_PROJECT_REF.supabase.co/rest/v1/icp_companies?on_conflict=company_key"
+      },
+      "position": [
+        1560,
+        240
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "id": "s10",
+      "name": "Failed records only",
+      "parameters": {
+        "jsCode": "return $input.all().filter(i => !i.json.ok).map(i => ({ json: { node: 'Upsert to Salesforce', error: i.json.error, payload: i.json.record } }));"
+      },
+      "position": [
+        1560,
+        420
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "s11",
+      "name": "Format Salesforce error",
+      "parameters": {
+        "jsCode": "return { json: { node: 'Upsert to Salesforce (whole batch)', error: String($json.error?.message || $json.error || 'unknown error').slice(0, 500), payload: { keys: $('Build Salesforce batches').item.json.keys } } };",
+        "mode": "runOnceForEachItem"
+      },
+      "position": [
+        1340,
+        600
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "s12",
+      "name": "Save to dead_letter",
+      "parameters": {
+        "dataToSend": "autoMapInputData",
+        "operation": "create",
+        "tableId": "dead_letter"
+      },
+      "position": [
+        1780,
+        520
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    },
+    {
+      "id": "s13",
+      "name": "Summarize run",
+      "parameters": {
+        "jsCode": "// One row for the runs logbook.\nconst results = $input.all();\nreturn [{ json: {\n  started_at: $('Score with ICP v2').first().json.scored_at,\n  finished_at: new Date().toISOString(),\n  sourced: $('Get companies to score').all().length,\n  new_companies: $('Score with ICP v2').all().filter(i => i.json.gate_passed).length,\n  qualified: $('Keep qualified (50+)').all().length,\n  upserted: results.filter(i => i.json.ok).length,\n  errors: results.filter(i => !i.json.ok).length\n}}];"
+      },
+      "position": [
+        1560,
+        60
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase gtm-lab"
+        }
+      },
+      "id": "s14",
+      "name": "Save run log",
+      "parameters": {
+        "dataToSend": "autoMapInputData",
+        "operation": "create",
+        "tableId": "runs"
+      },
+      "position": [
+        1780,
+        60
+      ],
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "Build Salesforce batches": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Upsert to Salesforce",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Failed records only": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to dead_letter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Format Salesforce error": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save to dead_letter",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Get companies to score": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Score with ICP v2",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Keep qualified (50+)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Build Salesforce batches",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Read Salesforce results": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save sync status",
+            "type": "main"
+          },
+          {
+            "index": 0,
+            "node": "Failed records only",
+            "type": "main"
+          },
+          {
+            "index": 0,
+            "node": "Summarize run",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Score with ICP v2": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save scores to Supabase",
+            "type": "main"
+          },
+          {
+            "index": 0,
+            "node": "Keep qualified (50+)",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Get companies to score",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Summarize run": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Save run log",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Upsert to Salesforce": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Read Salesforce results",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Format Salesforce error",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
