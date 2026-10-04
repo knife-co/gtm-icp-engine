@@ -1,0 +1,5 @@
+.env
+*.key
+*.crt
+*.pem
+node_modules/
